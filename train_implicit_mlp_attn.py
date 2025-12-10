@@ -1,8 +1,8 @@
 # /// script
 # dependencies = [
-#     "accelerate",
-#     "titans-pytorch",
-#     "tqdm"
+#     "accelerate",      # 用于分布式训练加速
+#     "titans-pytorch",  # 包含自定义的注意力机制实现
+#     "tqdm"             # 进度条显示
 # ]
 # ///
 
@@ -13,45 +13,49 @@ import tqdm
 import numpy as np
 
 import torch
-from torch.optim import Adam
-from torch import nn, Tensor
-from torch.nn import Module, ModuleList
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.optim import Adam      # Adam优化器
+from torch import nn, Tensor      # 神经网络模块和张量
+from torch.nn import Module, ModuleList  # 模块基类和模块列表
+import torch.nn.functional as F  # 神经网络功能函数
+from torch.utils.data import DataLoader, Dataset  # 数据加载器和数据集
 
-from einops import rearrange
+from einops import rearrange      # 张量维度重排工具
 
-from titans_pytorch.implicit_mlp_attention import ImplicitMLPAttention
-from titans_pytorch.nested_attention import NestedAttention
+from titans_pytorch.implicit_mlp_attention import ImplicitMLPAttention  # 隐式MLP注意力机制
+from titans_pytorch.nested_attention import NestedAttention            # 嵌套注意力机制
 
-from accelerate import Accelerator
+from accelerate import Accelerator  # 分布式训练加速器
 
-# constants
+# 常量定义
 
-NUM_BATCHES = int(1e5)
-BATCH_SIZE = 4
-GRAD_ACCUM_EVERY = 4
-LEARNING_RATE = 1e-4
-VALIDATE_EVERY = 100
-PRIME_LENGTH = 32
-GENERATE_EVERY = 250
-GENERATE_LENGTH = 512
-SEQ_LEN = 512
+NUM_BATCHES = int(1e5)      # 训练批次数
+BATCH_SIZE = 4              # 批处理大小
+GRAD_ACCUM_EVERY = 4        # 梯度累积步数
+LEARNING_RATE = 1e-4        # 学习率
+VALIDATE_EVERY = 100        # 每100个批次验证一次
+PRIME_LENGTH = 32           # 生成文本时的提示长度
+GENERATE_EVERY = 250        # 每250个批次生成一次文本
+GENERATE_LENGTH = 512       # 生成文本的长度
+SEQ_LEN = 512               # 序列长度
 
-# helpers
+# 辅助函数
 
 def exists(v):
+    """检查值是否存在（不为None）"""
     return v is not None
 
 def cycle(loader):
+    """循环迭代数据加载器"""
     while True:
         for data in loader:
             yield data
 
 def decode_token(token):
+    """将token解码为字符，确保ASCII值不小于32（可打印字符）"""
     return str(chr(max(32, token)))
 
 def decode_tokens(tokens):
+    """将token序列解码为字符串"""
     return "".join(list(map(decode_token, tokens)))
 
 # sampling helpers

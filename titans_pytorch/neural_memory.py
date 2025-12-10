@@ -576,18 +576,33 @@ class NeuralMemory(Module):
         mask: Tensor | None = None,
         return_surprises = True
     ):
+        """
+        存储记忆到神经内存中。
+        
+        参数:
+        - seq: 输入序列
+        - weights: 内存网络的权重，如果为None则初始化新权重
+        - past_state: 过去的状态，包含权重和动量信息
+        - seq_index: 当前序列索引
+        - prev_weights: 上一层的权重，用于影响当前层的surprise计算
+        - mask: 存储掩码，用于控制哪些位置的记忆被存储
+        - return_surprises: 是否返回surprises信息
+        
+        返回值:
+        - updates: 更新后的内存网络权重
+        - next_store_state: 下一个存储状态
+        - surprises: (可选)包含unweighted_mem_model_loss和adaptive_lr的元组
+        """
         if self.qkv_receives_diff_views:
             _, batch, seq_len = seq.shape[:3]
         else:
             batch, seq_len = seq.shape[:2]
 
-        # shapes and variables
-
+        # 获取配置参数
         heads, chunk_size, num_updates = self.heads, self.store_chunk_size, self.num_kv_per_token
 
-        # curtail sequence by multiple of the chunk size
-        # only a complete chunk of the sequence provides the memory for the next chunk
-
+        # 将序列裁剪为chunk_size的整数倍
+        # 只有完整的chunk才能为下一个chunk提供记忆
         round_down_seq_len = round_down_multiple(seq_len, chunk_size)
         num_chunks = round_down_seq_len // chunk_size
 
@@ -595,38 +610,35 @@ class NeuralMemory(Module):
 
         next_seq_len_index = seq_index + round_down_seq_len
 
-        # init weights if needed
-        # weights of the memory network
-
+        # 如果没有提供权重，则初始化权重
         if not exists(weights):
             weights = self.init_weights(batch)
 
         weights = TensorDict(weights)
 
-        # allow for neural memory of a previous layer to influence surprise of current layer
-
+        # 允许前一层的神经内存影响当前层的surprise计算
         weights_for_surprise = repeat_dict_values(weights, 'b ... -> b n ...', n = num_chunks)
 
-        # initial norm
-
+        # 对输入序列进行归一化
         seq = self.store_norm(seq)
 
-        # handle keys and values coming from different sequences from hyper connection
-
+        # 处理来自超连接的不同序列的键和值
         values_seq = seq
 
         if self.qkv_receives_diff_views:
             seq, values_seq = seq
 
-        # derive learned hparams for optimization of memory network
-
+        # 为内存网络的优化推导出学习的超参数
         adaptive_lr = self.to_adaptive_step(seq)
         adaptive_lr = self.adaptive_step_transform(adaptive_lr)
 
+        # 将序列减少到chunk表示
         chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
 
+        # 计算衰减因子
         decay_factor = self.to_decay_factor(chunked_seq).sigmoid()
 
+        # 检查是否需要层学习率调制和动量
         need_layer_lr_mod = exists(self.to_layer_modulation) and num_chunks > 0
         has_momentum = exists(self.to_momentum)
 
@@ -641,41 +653,34 @@ class NeuralMemory(Module):
         if need_layer_lr_mod:
             layer_lr_mod = self.to_layer_modulation(chunked_seq) * self.max_mem_layer_modulation
 
-        # keys and values
-
+        # 生成键和值
         keys = self.to_keys(seq)
         values = self.to_values(values_seq)
 
-        # maybe multi head
-
+        # 多头处理
         keys, values = map(self.split_kv_heads, (keys, values))
 
-        # maybe keys rmsnorm
-
+        # 对键进行RMS归一化
         keys = self.k_norm(keys)
 
-        # take care of chunking
-
+        # 处理分块
         keys, values = tuple(rearrange(t, 'b h (n c u) d -> (b h n) (c u) d', c = chunk_size, u = num_updates) for t in (keys, values))
 
-        # adaptive lr
-
+        # 调整自适应学习率的形状
         adaptive_lr = rearrange(adaptive_lr, 'b (n c u) -> (b n) (c u)', c = chunk_size, u = num_updates)
 
-        # optionally a storing memories mask can be passed in. if False, will set the learning rate to 0. for those positions
-
+        # 应用存储记忆掩码，如果为False，则将该位置的学习率设置为0
         if exists(mask):
             mask = mask[..., :round_down_seq_len]
             mask = repeat(mask, 'b (n c) -> (b h n) (c u)', h = heads, u = num_updates, c = chunk_size)
 
             adaptive_lr = torch.where(mask, adaptive_lr, 0.)
 
-        # maybe add previous layer weight
-
+        # 断言检查learned_weight_residual_mix和prev_weights的存在性是否一致
         assert xnor(exists(self.to_learned_weight_residual_mix), exists(prev_weights))
 
+        # 添加前一层的权重
         if exists(prev_weights):
-
             start_index = math.ceil(seq_index / chunk_size)
             end_index = start_index + num_chunks
 
@@ -688,37 +693,30 @@ class NeuralMemory(Module):
 
             weights_for_surprise = weights_for_surprise + prev_weights
 
-        # flatten batch and time if surprise depends on previous layer memory model
-
+        # 展平批处理和时间维度（如果surprise依赖于前一层的内存模型）
         weights_for_surprise = rearrange_dict_values(weights_for_surprise, 'b n ... -> (b n) ...')
 
-        # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
-
+        # 获取梯度和额外的辅助损失（用于通过基础神经内存模块中的qkv投影进行反向传播）
         grads, unweighted_mem_model_loss = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
 
         grads = TensorDict(grads)
 
-        # surprises
-
+        # 调整adaptive_lr和unweighted_mem_model_loss的形状
         adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
         unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
 
-        # maybe softclamp grad norm
-
+        # 软钳位梯度范数
         if exists(self.max_grad_norm):
             grads = grads.apply(lambda t: softclamp_grad_norm(t, self.max_grad_norm))
 
-        # restore batch and sequence dimension
-
+        # 恢复批处理和序列维度
         grads = rearrange_dict_values(grads, '(b n) ... -> b n ...', b = batch * heads)
 
-        # maybe per layer modulation
-
+        # 每层调制
         if need_layer_lr_mod:
             grads = TensorDict({name: einx.multiply('b h, b h ... -> b h ...', layer_lr_mod, t) for layer_lr_mod, (name, t) in zip(layer_lr_mod, grads.items())})
 
-        # negative gradients, adaptive lr already applied as loss weight
-
+        # 负梯度，自适应学习率已经作为损失权重应用
         surprises = grads.mul(-1)
 
         # past states
@@ -816,14 +814,24 @@ class NeuralMemory(Module):
         seq,
         weights: dict[str, Tensor],
     ):
+        """
+        从神经内存中检索记忆。
+        
+        参数:
+        - seq: 用于检索记忆的序列
+        - weights: 内存网络的权重
+        
+        返回值:
+        - 检索到的记忆值
+        """
         chunk_size = self.retrieve_chunk_size
 
+        # 检查权重是否具有扩展形状
         weights_have_expanded_shape = dict_get_value_shapes(weights) != self.init_weight_shape
 
         batch, seq_len = seq.shape[:2]
 
-        # auto infer single token decoding, if there are only 1 set of weights and 1 token
-
+        # 自动推断是否为单个token解码（如果只有1组权重和1个token）
         is_one_token = seq_len == 1
         is_one_weight = (not weights_have_expanded_shape) or next(iter(weights.values())).shape[1] == 1
 
@@ -832,8 +840,7 @@ class NeuralMemory(Module):
         if is_single_token_decode:
             chunk_size = 1
 
-        # padding related, for chunked processing
-
+        # 与分块处理相关的填充
         need_pad = chunk_size > 1 or not is_one_weight
 
         if need_pad:
@@ -841,62 +848,55 @@ class NeuralMemory(Module):
 
         seq_len_plus_one = seq.shape[-2]
 
+        # 将序列长度向上舍入到chunk_size的整数倍
         next_seq_len = round_up_multiple(seq_len_plus_one, chunk_size)
 
+        # 计算需要填充的长度并进行填充
         padding = next_seq_len - seq_len_plus_one
         seq = pad_at_dim(seq, (0, padding), dim = 1)
 
-        # the parameters of the memory model stores the memories of the key / values
-        # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
+        # 内存模型的参数存储键/值的记忆
+        # 当MLP只有1个权重矩阵时，它等价于线性注意力文献中的`kv`快速权重记忆（记忆的获取是q @ (kv)）/ schmidhuber的论文
 
         weights = TensorDict(weights)
 
-        # pre norm
-
+        # 对序列进行归一化
         seq = self.retrieve_norm(seq)
 
-        # sequence Float['b n d'] to queries
-
+        # 从序列生成查询
         queries = self.to_queries(seq)
 
-        # maybe multihead
-
+        # 多头处理
         queries = self.split_heads(queries)
 
-        # maybe qk rmsnorm
-
+        # 对查询进行RMS归一化
         queries = self.q_norm(queries)
 
-        # fetch values from memory model
-
+        # 从内存模型获取值
         if weights_have_expanded_shape:
             weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
 
+        # 调整查询的形状以适应分块处理
         queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
 
-        # forward functional call
-
+        # 前向函数调用
         values = functional_call(self.memory_model, dict(weights), queries)
 
-        # reconstitute batch dimension
-
+        # 重构批处理维度
         values = rearrange(values, '(b h n) c d -> b h (n c) d', b = batch, h = self.heads)
 
+        # 多头RMS归一化
         values = self.multihead_rmsnorm(values)
 
-        # maybe gate
-
+        # 可选的门控
         if exists(self.retrieve_gate):
             values = values * self.retrieve_gate(seq)
 
-        # maybe merge heads and combine
-
+        # 合并头并组合
         values = self.merge_heads(values)
-
         values = self.combine_heads(values)
 
-        # restore, pad with empty memory embed
-
+        # 恢复原始序列长度，移除填充
         if need_pad:
             values = values[:, 1:]
 
@@ -913,35 +913,48 @@ class NeuralMemory(Module):
         return_surprises = False,
         ttt_batch_size: int | None = None
     ):
+        """
+        神经内存的前向传播。
+        
+        参数:
+        - seq: 输入序列
+        - store_seq: 用于存储的序列，如果为None则使用seq
+        - state: 神经内存状态
+        - detach_mem_state: 是否分离内存状态
+        - prev_weights: 上一层的权重
+        - store_mask: 存储掩码
+        - return_surprises: 是否返回surprises
+        - ttt_batch_size: TTT批处理大小
+        
+        返回值:
+        - 检索到的记忆值
+        - 下一个神经内存状态
+        - (可选)surprises
+        """
         is_multi_input = self.qkv_receives_diff_views
 
-        # handle single token
-
+        # 处理单个token输入
         if seq.ndim == 2 or (is_multi_input and seq.ndim == 3):
             seq = rearrange(seq, '... b d -> ... b 1 d')
 
         is_single_token = seq.shape[-2] == 1
 
-        # if different views for qkv, then
-
+        # 如果qkv接收不同的视图
         if is_multi_input:
             retrieve_seq, seq = seq[0], seq[1:]
         else:
             retrieve_seq = seq
 
-        # handle previous state init
-
+        # 处理前一个状态的初始化
         if not exists(state):
             state = (0, None, None, None, None)
 
         seq_index, weights, cache_store_seq, past_state, updates = state
 
-        # store
-
+        # 获取用于存储的序列
         store_seq = default(store_seq, seq)
 
-        # take care of cache
-
+        # 处理缓存
         if exists(cache_store_seq):
             store_seq = safe_cat((cache_store_seq, store_seq))
 
