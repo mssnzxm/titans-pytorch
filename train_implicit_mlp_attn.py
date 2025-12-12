@@ -98,8 +98,8 @@ class Transformer(Module):
     ):
         """
         参数:
-        - num_tokens: 词汇表大小
-        - dim: 模型维度
+        - num_tokens: 词汇表大小，在当前代码中设为256，对应ASCII字符集
+        - dim: 模型维度。嵌入向量维度 （Embedding Dimension），表示每个token被映射到的向量长度（在当前代码中设为512，与Transformer模型的隐藏维度一致）
         - depth: 模型深度
         - heads: 注意力头数
         - implicit_mlp_attn_hiddens: 隐式MLP注意力的隐藏层维度
@@ -112,7 +112,7 @@ class Transformer(Module):
         self.token_emb = nn.Embedding(num_tokens, dim)  # token嵌入层
 
         self.layers = ModuleList([])  # 存储模型层
-
+        # 是 字典解包运算符，字典中的所有键值对作为额外的关键字参数传递给注意力层的构造函数。
         for _ in range(depth):
             # 根据配置选择注意力机制
             if use_nested_attn:
@@ -163,16 +163,16 @@ class Transformer(Module):
         - 生成的token序列
         """
         prompt_seq_len, out = prompt.shape[-1], prompt.clone()
-        sample_num_times = max(0, seq_len - prompt_seq_len)
+        sample_num_times = max(0, seq_len - prompt_seq_len)# 计算需要生成的token数量
 
-        for _ in range(sample_num_times):
-            logits = self.forward(out, return_loss = False)  # 获取logits
-            logits = logits[:, -1]  # 只取最后一个token的logits
+        for _ in range(sample_num_times): # 循环生成新token
+            logits = self.forward(out, return_loss = False)  # 获取logits# 预测下一个token的概率分布
+            logits = logits[:, -1]   # 只取最后一个token的预测结果ß
 
             logits = top_k(logits, thres = filter_thres)  # top-k过滤
-            sample = gumbel_sample(logits, temperature = temperature, dim = -1)  # 采样
+            sample = gumbel_sample(logits, temperature = temperature, dim = -1)  # 采样新token
 
-            out = torch.cat((out, sample), dim = -1)  # 将采样结果添加到输出序列
+            out = torch.cat((out, sample), dim = -1)  # 将采样新token结果添加到输出序列
 
         return out[..., prompt_seq_len:]  # 返回新生成的部分
 
