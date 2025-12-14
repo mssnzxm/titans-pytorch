@@ -11,6 +11,7 @@ import gzip
 import random
 import tqdm
 import numpy as np
+import os
 
 import torch
 from torch.optim import Adam      # Adam优化器
@@ -37,6 +38,12 @@ PRIME_LENGTH = 32           # 生成文本时的提示长度
 GENERATE_EVERY = 250        # 每250个批次生成一次文本
 GENERATE_LENGTH = 512       # 生成文本的长度
 SEQ_LEN = 512               # 序列长度
+
+# 模型保存配置
+SAVE_DIR = "./models"        # 模型保存目录
+SAVE_EVERY = 5000            # 每5000个批次保存一次模型
+SAVE_BEST = True            # 是否保存最佳模型（基于验证损失）
+SAVE_OPTIMIZER = True       # 是否保存优化器状态
 
 # 辅助函数
 
@@ -263,6 +270,12 @@ model, optim, train_loader, val_loader = executor.prepare(model, optim, train_lo
 train_loader = cycle(train_loader)
 val_loader = cycle(val_loader)
 
+# 创建模型保存目录
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# 用于跟踪最佳验证损失
+best_val_loss = float('inf')
+
 # 训练循环
 
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
@@ -283,14 +296,54 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
     optim.step()  # 更新参数
     optim.zero_grad()  # 清空梯度
 
+    # 定期保存模型
+    if i % SAVE_EVERY == 0 and i > 0:
+        save_path = os.path.join(SAVE_DIR, f"model_checkpoint_{i}.pt")
+        
+        # 构建保存字典
+        save_dict = {
+            "epoch": i,
+            "model_state_dict": model.state_dict(),
+            "train_loss": loss.item()
+        }
+        
+        # 如果需要保存优化器状态
+        if SAVE_OPTIMIZER:
+            save_dict["optimizer_state_dict"] = optim.state_dict()
+        
+        # 保存模型
+        executor.save(save_dict, save_path)
+        executor.print(f"模型已保存到: {save_path}")
+
     # 验证
     if i % VALIDATE_EVERY == 0:
         model.eval()  # 设置模型为评估模式
         with torch.no_grad():
             valid_data = next(val_loader)  # 获取验证数据
 
-            loss = model(valid_data, return_loss = True)  # 计算验证损失
-            executor.print(f"validation loss: {loss.item():.3f}")  # 打印验证损失
+            val_loss = model(valid_data, return_loss = True)  # 计算验证损失
+            executor.print(f"validation loss: {val_loss.item():.3f}")  # 打印验证损失
+            
+            # 保存最佳模型
+            if SAVE_BEST and val_loss.item() < best_val_loss:
+                best_val_loss = val_loss.item()
+                best_save_path = os.path.join(SAVE_DIR, "best_model.pt")
+                
+                # 构建保存字典
+                best_save_dict = {
+                    "epoch": i,
+                    "model_state_dict": model.state_dict(),
+                    "val_loss": best_val_loss,
+                    "train_loss": loss.item()
+                }
+                
+                # 如果需要保存优化器状态
+                if SAVE_OPTIMIZER:
+                    best_save_dict["optimizer_state_dict"] = optim.state_dict()
+                
+                # 保存最佳模型
+                executor.save(best_save_dict, best_save_path)
+                executor.print(f"最佳模型已保存到: {best_save_path}, 验证损失: {best_val_loss:.3f}")
 
     # 生成文本
     if i % GENERATE_EVERY == 0:
@@ -308,3 +361,23 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
         base_decode_output = decode_tokens(sampled[0])  # 解码生成的文本
 
         executor.print(f"\n[generated]: {base_decode_output}\n\n")  # 打印生成的文本
+
+# 保存最终模型
+executor.print("\n训练完成！保存最终模型...")
+final_save_path = os.path.join(SAVE_DIR, "final_model.pt")
+
+# 构建保存字典
+final_save_dict = {
+    "epoch": NUM_BATCHES,
+    "model_state_dict": model.state_dict(),
+    "best_val_loss": best_val_loss
+}
+
+# 如果需要保存优化器状态
+if SAVE_OPTIMIZER:
+    final_save_dict["optimizer_state_dict"] = optim.state_dict()
+
+# 保存最终模型
+executor.save(final_save_dict, final_save_path)
+executor.print(f"最终模型已保存到: {final_save_path}")
+executor.print(f"最佳验证损失: {best_val_loss:.3f}")
