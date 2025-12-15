@@ -65,6 +65,12 @@ def decode_tokens(tokens):
     """将token序列解码为字符串"""
     return "".join(list(map(decode_token, tokens)))
 
+def get_model_state_dict(model):
+    """获取模型的状态字典，处理多GPU环境下的包装情况"""
+    if hasattr(model, 'module'):
+        return model.module.state_dict()
+    return model.state_dict()
+
 # 采样辅助函数
 
 def log(t, eps = 1e-20):
@@ -123,6 +129,7 @@ class Transformer(Module):
         for _ in range(depth):
             # 根据配置选择注意力机制
             if use_nested_attn:
+                # 使用嵌套注意力机制
                 attn = NestedAttention(
                     dim = dim,
                     dim_head = dim_head,
@@ -130,6 +137,7 @@ class Transformer(Module):
                     **attn_kwargs
                 )
             else:
+                # 使用隐式MLP注意力机制
                 attn = ImplicitMLPAttention(
                     dim = dim,
                     mlp_hiddens = implicit_mlp_attn_hiddens,
@@ -261,7 +269,7 @@ val_loader = DataLoader(val_dataset, batch_size = BATCH_SIZE)
 optim = Adam(model.parameters(), lr = LEARNING_RATE)
 
 # 初始化Accelerator
-executor = Accelerator()
+executor = Accelerator(split_batches=True, mixed_precision='fp16')
 
 # 准备模型、优化器和数据加载器
 model, optim, train_loader, val_loader = executor.prepare(model, optim, train_loader, val_loader)
@@ -271,7 +279,8 @@ train_loader = cycle(train_loader)
 val_loader = cycle(val_loader)
 
 # 创建模型保存目录
-os.makedirs(SAVE_DIR, exist_ok=True)
+if executor.is_main_process:
+    os.makedirs(SAVE_DIR, exist_ok=True)
 
 # 用于跟踪最佳验证损失
 best_val_loss = float('inf')
@@ -289,7 +298,8 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
         executor.backward(loss / GRAD_ACCUM_EVERY)  # 反向传播，注意损失要除以梯度累积步数
 
-    executor.print(f"training loss: {loss.item():.3f}")  # 打印训练损失
+    if executor.is_main_process:
+        executor.print(f"training loss: {loss.item():.3f}")  # 打印训练损失
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # 梯度裁剪
 
@@ -297,13 +307,13 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
     optim.zero_grad()  # 清空梯度
 
     # 定期保存模型
-    if i % SAVE_EVERY == 0 and i > 0:
+    if i % SAVE_EVERY == 0 and i > 0 and executor.is_main_process:
         save_path = os.path.join(SAVE_DIR, f"model_checkpoint_{i}.pt")
         
         # 构建保存字典
         save_dict = {
             "epoch": i,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": get_model_state_dict(model),
             "train_loss": loss.item()
         }
         
@@ -322,31 +332,33 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
             valid_data = next(val_loader)  # 获取验证数据
 
             val_loss = model(valid_data, return_loss = True)  # 计算验证损失
-            executor.print(f"validation loss: {val_loss.item():.3f}")  # 打印验证损失
             
-            # 保存最佳模型
-            if SAVE_BEST and val_loss.item() < best_val_loss:
-                best_val_loss = val_loss.item()
-                best_save_path = os.path.join(SAVE_DIR, "best_model.pt")
-                
-                # 构建保存字典
-                best_save_dict = {
-                    "epoch": i,
-                    "model_state_dict": model.state_dict(),
-                    "val_loss": best_val_loss,
-                    "train_loss": loss.item()
-                }
-                
-                # 如果需要保存优化器状态
-                if SAVE_OPTIMIZER:
-                    best_save_dict["optimizer_state_dict"] = optim.state_dict()
+            if executor.is_main_process:
+                executor.print(f"validation loss: {val_loss.item():.3f}")  # 打印验证损失
                 
                 # 保存最佳模型
-                executor.save(best_save_dict, best_save_path)
-                executor.print(f"最佳模型已保存到: {best_save_path}, 验证损失: {best_val_loss:.3f}")
+                if SAVE_BEST and val_loss.item() < best_val_loss:
+                    best_val_loss = val_loss.item()
+                    best_save_path = os.path.join(SAVE_DIR, "best_model.pt")
+                    
+                    # 构建保存字典
+                    best_save_dict = {
+                        "epoch": i,
+                        "model_state_dict": get_model_state_dict(model),
+                        "val_loss": best_val_loss,
+                        "train_loss": loss.item()
+                    }
+                    
+                    # 如果需要保存优化器状态
+                    if SAVE_OPTIMIZER:
+                        best_save_dict["optimizer_state_dict"] = optim.state_dict()
+                    
+                    # 保存最佳模型
+                    executor.save(best_save_dict, best_save_path)
+                    executor.print(f"最佳模型已保存到: {best_save_path}, 验证损失: {best_val_loss:.3f}")
 
     # 生成文本
-    if i % GENERATE_EVERY == 0:
+    if i % GENERATE_EVERY == 0 and executor.is_main_process:
         model.eval()  # 设置模型为评估模式
 
         inp = next(val_loader)[0, :PRIME_LENGTH]  # 获取提示文本
@@ -356,28 +368,33 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
         prompt = inp[None, ...]  # 添加批次维度
 
-        sampled = model.sample(prompt, GENERATE_LENGTH)  # 生成文本
+        # 在多GPU环境下，模型会被包装在DistributedDataParallel中
+        if hasattr(model, 'module'):
+            sampled = model.module.sample(prompt, GENERATE_LENGTH)  # 生成文本
+        else:
+            sampled = model.sample(prompt, GENERATE_LENGTH)  # 生成文本
 
         base_decode_output = decode_tokens(sampled[0])  # 解码生成的文本
 
         executor.print(f"\n[generated]: {base_decode_output}\n\n")  # 打印生成的文本
 
 # 保存最终模型
-executor.print("\n训练完成！保存最终模型...")
-final_save_path = os.path.join(SAVE_DIR, "final_model.pt")
+if executor.is_main_process:
+    executor.print("\n训练完成！保存最终模型...")
+    final_save_path = os.path.join(SAVE_DIR, "final_model.pt")
 
-# 构建保存字典
-final_save_dict = {
-    "epoch": NUM_BATCHES,
-    "model_state_dict": model.state_dict(),
-    "best_val_loss": best_val_loss
-}
+    # 构建保存字典
+    final_save_dict = {
+        "epoch": NUM_BATCHES,
+        "model_state_dict": get_model_state_dict(model),
+        "best_val_loss": best_val_loss
+    }
 
-# 如果需要保存优化器状态
-if SAVE_OPTIMIZER:
-    final_save_dict["optimizer_state_dict"] = optim.state_dict()
+    # 如果需要保存优化器状态
+    if SAVE_OPTIMIZER:
+        final_save_dict["optimizer_state_dict"] = optim.state_dict()
 
-# 保存最终模型
-executor.save(final_save_dict, final_save_path)
-executor.print(f"最终模型已保存到: {final_save_path}")
-executor.print(f"最佳验证损失: {best_val_loss:.3f}")
+    # 保存最终模型
+    executor.save(final_save_dict, final_save_path)
+    executor.print(f"最终模型已保存到: {final_save_path}")
+    executor.print(f"最佳验证损失: {best_val_loss:.3f}")

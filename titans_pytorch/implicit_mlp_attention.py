@@ -26,6 +26,9 @@ class ImplicitMLPAttention(Module):
     该模块将注意力机制与MLP结构相结合，实现了一种隐式的记忆MLP。
     它通过多个注意力层的链式连接来模拟MLP的计算过程，
     每个注意力层的键值对形成了MLP的隐式权重。
+    Talking-Heads Attention是谷歌提出的注意力机制改进技术，
+    通过在softmax操作前后引入线性映射，增强多头注意力间的信息交流
+    提升模型性能但增加计算复杂度。其核心是解决传统多头注意力中各头独立运作、参数利用率低的问题。
     """
     def __init__(
         self,
