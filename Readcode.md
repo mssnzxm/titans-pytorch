@@ -3,11 +3,17 @@
 ## 1. 项目概述
 
 Titans是一种创新的Transformer架构，其核心特点是**在测试时学习记忆**（Test-Time Learning）。与传统Transformer不同，它通过神经记忆模块动态存储和检索信息，无需预训练的固定记忆结构。
+- 不同层次的组件 ：ImplicitMLPAttention 是一种注意力机制（较低层次），而 MemoryAsContextTransformer 是一个完整的模型架构（较高层次）
+- 没有直接依赖 ：MemoryAsContextTransformer 使用 SegmentedAttention 作为其注意力机制，没有直接使用 ImplicitMLPAttention
+- 不同设计思路 ：ImplicitMLPAttention 关注注意力与 MLP 的结合，而 MemoryAsContextTransformer 关注神经内存与 Transformer 的结合
 
 ## 2. 核心组件
 
 ### 2.1 MemoryAsContextTransformer (MAC)
-
+类的调用顺序如下：
+MemoryAsContextTransformer-->NeuralMemory-->MemoryMLP
+MemoryAsContextTransformer 使用 SegmentedAttention 作为其注意力机制，没有直接使用 ImplicitMLPAttention
+ImplicitMLPAttention-->NestedAttention
 这是主Transformer架构，集成了神经记忆模块：
 
 - **分块注意力**：将长序列分块处理，每个块大小由`segment_len`参数控制
