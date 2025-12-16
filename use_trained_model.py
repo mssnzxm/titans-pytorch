@@ -107,7 +107,7 @@ def main():
     print("\n=== 使用训练好的模型生成文本 ===")
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="使用训练好的模型生成文本")
-    parser.add_argument("--model_path", type=str, default="./models/best_model.pt", 
+    parser.add_argument("--model_path", type=str, default="./models/final_model.pt", 
                       help="训练好的模型路径")
     parser.add_argument("--prompt", type=str, default="Hello, world!", 
                       help="生成文本的提示")

@@ -2,6 +2,7 @@ train_local.py
 .DS_Store
 
 # Byte-compiled / optimized / DLL files
+Qwen3-0.6B/*
 models/*
 __pycache__/
 *.py[cod]
