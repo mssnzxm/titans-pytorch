@@ -256,45 +256,89 @@ def default_loss_fn(pred, target):
     return (pred - target).pow(2).mean(dim = -1)
 
 class NeuralMemory(Module):
+    """
+    神经内存模块 - 实现可学习的动态内存存储与检索机制
+    
+    该模块是一个基于神经网络的内存系统，能够动态地存储和检索信息。它将内存表示为
+    神经网络的权重，并通过学习的方式更新这些权重，从而实现高效的信息存储和检索。
+    
+    核心原理:
+    - 将内存建模为神经网络(默认为MLP)的权重参数
+    - 使用键值对(Key-Value)机制存储和检索记忆
+    - 支持自适应学习率、动量和权重衰减等优化技术
+    - 通过分块(chunk)处理实现高效的序列数据处理
+    - 支持多头注意力机制，增强记忆表示能力
+    
+    主要功能:
+    - store_memories: 将输入序列存储到神经内存中
+    - retrieve_memories: 从神经内存中检索相关信息
+    - 支持动量优化，提高内存更新的稳定性
+    - 支持自适应学习率，根据输入动态调整内存更新强度
+    - 支持多头结构，增强内存的表示能力
+    
+    应用场景:
+    - 长序列建模任务
+    - 记忆增强的语言模型
+    - 需要长期依赖建模的任务
+    - 持续学习和终身学习系统
+    """
     def __init__(
         self,
-        dim,
-        chunk_size: int | tuple[int, int] = 1,
-        batch_size = None,
-        dim_head = None,
-        heads = 1,
-        model: Module | None = None,
-        store_memory_loss_fn: Callable = default_loss_fn,
-        adaptive_step_transform: Callable | None = None,
-        default_step_transform_max_lr = 1.,
-        per_parameter_lr_modulation = False, # allow outer network to control learning rate per weight matrix of memory network
-        max_mem_layer_modulation = 1., # max of 10.
-        per_head_learned_parameters = True,
-        attn_pool_chunks = False,
-        momentum = True,
-        momentum_order = 1,
-        learned_momentum_combine = False,
-        learned_combine_include_zeroth = False,
-        num_kv_per_token = 1, # whether a single token can do multiple updates to the memory model
-        qkv_receives_diff_views = False, # to address an issue raised by a phd student (who will be credited if experiments are green). basically the issue raised is that the memory MLP is only learning Wk @ Wv linear mapping and that may not be expressive enough. we will use hyper connections to allow the network to choose different previous layer inputs as keys / values and see if that does anything
-        pre_rmsnorm = True,
-        post_rmsnorm = False,
-        qk_rmsnorm = False,
-        max_grad_norm: float | None = None,
-        use_accelerated_scan = False,
-        activation: Module | None = None,
-        init_adaptive_step_bias = None,
-        init_momentum_bias = None,
-        init_decay_bias = None,
-        accept_weight_residual = False,
-        spectral_norm_surprises = False,
-        gated_transition = False,
-        mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
+        dim, # 输入特征维度
+        chunk_size: int | tuple[int, int] = 1, # 分块大小，可分别指定检索和存储的分块大小
+        batch_size = None, # 批处理大小
+        dim_head = None, # 每个注意力头的维度，默认与dim相同
+        heads = 1, # 注意力头的数量
+        model: Module | None = None, # 内存模型，默认为MLP
+        store_memory_loss_fn: Callable = default_loss_fn, # 存储记忆时使用的损失函数
+        adaptive_step_transform: Callable | None = None, # 自适应学习率转换函数
+        default_step_transform_max_lr = 1., # 默认学习率转换的最大学习率
+        per_parameter_lr_modulation = False, # 是否允许外部网络控制每个权重矩阵的学习率
+        max_mem_layer_modulation = 1., # 内存层调制的最大值
+        per_head_learned_parameters = True, # 是否为每个注意力头学习独立的参数
+        attn_pool_chunks = False, # 是否使用注意力池化来处理分块
+        momentum = True, # 是否使用动量优化
+        momentum_order = 1, # 动量的阶数
+        learned_momentum_combine = False, # 是否学习动量的组合方式
+        learned_combine_include_zeroth = False, # 是否在学习组合中包含零阶项
+        num_kv_per_token = 1, # 每个标记可以进行的键值更新次数
+        qkv_receives_diff_views = False, # 键值是否接收不同的视图
+        pre_rmsnorm = True, # 是否在处理前使用RMSNorm归一化
+        post_rmsnorm = False, # 是否在处理后使用RMSNorm归一化
+        qk_rmsnorm = False, # 是否对查询和键使用RMSNorm归一化
+        max_grad_norm: float | None = None, # 梯度范数的最大值，用于梯度裁剪
+        use_accelerated_scan = False, # 是否使用加速扫描
+        activation: Module | None = None, # 激活函数
+        init_adaptive_step_bias = None, # 自适应步长的初始化偏置
+        init_momentum_bias = None, # 动量的初始化偏置
+        init_decay_bias = None, # 衰减因子的初始化偏置
+        accept_weight_residual = False, # 是否接受权重残差
+        spectral_norm_surprises = False, # 是否对更新前的惊喜值进行谱归一化
+        gated_transition = False, # 是否使用门控过渡
+        mem_model_norm_add_residual = True, # 是否在内存模型中添加残差连接和归一化
         default_model_kwargs: dict = dict(
-            depth = 2,
-            expansion_factor = 4.
+            depth = 2, # 默认MLP模型的深度
+            expansion_factor = 4. # 默认MLP模型的扩展因子
         )
     ):
+        """
+        初始化神经内存模块
+        
+        参数详解:
+        - dim: 输入特征的维度
+        - chunk_size: 分块处理的大小，可以是整数（检索和存储使用相同大小）或元组（分别指定检索和存储大小）
+        - batch_size: 批处理大小，用于初始化内存状态
+        - dim_head: 每个注意力头的特征维度，默认与dim相同
+        - heads: 注意力头的数量，默认为1
+        - model: 用于表示内存的神经网络模型，默认为MemoryMLP
+        - store_memory_loss_fn: 存储记忆时使用的损失函数，默认为均方误差
+        - adaptive_step_transform: 自适应学习率的转换函数，用于将模型输出转换为学习率
+        - per_parameter_lr_modulation: 是否允许为每个权重矩阵单独控制学习率
+        - momentum: 是否使用动量优化来稳定内存更新
+        - num_kv_per_token: 每个输入标记可以生成的键值对数量
+        - pre_rmsnorm: 是否在处理前对输入进行RMSNorm归一化
+        - max_grad_norm: 梯度裁剪的最大范数，用于稳定训练
+        """
         super().__init__()
         dim_head = default(dim_head, dim)
         assert not (heads == 1 and dim_head != dim)
@@ -540,12 +584,37 @@ class NeuralMemory(Module):
 
     @property
     def memory_model_parameter_dict(self):
+        """
+        获取内存模型参数的字典表示
+        
+        返回一个TensorDict对象，包含内存模型的所有参数，其中键是参数名称，值是对应的参数张量。
+        这种表示方式便于使用torch.func进行函数式调用和梯度计算。
+        
+        返回值:
+        - TensorDict: 包含内存模型所有参数的字典
+        """
         return TensorDict(dict(zip(self.memory_model_parameter_names, self.memory_model_parameters)))
 
     def init_weights(
         self,
         batch,
     ):
+        """
+        初始化内存模型的权重
+        
+        根据批处理大小和注意力头配置，初始化内存模型的权重。支持为每个注意力头
+        学习独立的参数或共享参数。
+        
+        参数:
+        - batch: 批处理大小
+        
+        返回值:
+        - TensorDict: 初始化后的权重字典，包含内存模型的所有参数
+        
+        逻辑:
+        - 如果per_head_learned_parameters为True，为每个注意力头创建独立的参数副本
+        - 否则，为所有注意力头和批处理创建共享参数的副本
+        """
         if self.per_head_learned_parameters:
             weights = repeat_dict_values(self.memory_model_parameter_dict, 'h ... -> (b h) ...', b = batch)
         else:
@@ -557,6 +626,23 @@ class NeuralMemory(Module):
         self,
         batch,
     ):
+        """
+        初始化动量状态
+        
+        创建与内存模型参数结构相同的零张量字典，用于存储动量信息。动量是一种优化技术，
+        可以使内存更新更加稳定，通过累积过去的梯度方向来平滑当前的更新。
+        
+        参数:
+        - batch: 批处理大小
+        
+        返回值:
+        - TensorDict: 初始化后的动量状态字典，包含与内存模型参数结构相同的零张量
+        
+        逻辑:
+        - 创建内存模型参数的零副本
+        - 根据per_head_learned_parameters配置和动量阶数，扩展零张量到适当的形状
+        - 返回初始化后的动量状态
+        """
         zeros = self.memory_model_parameter_dict.clone().zero_()
 
         if self.per_head_learned_parameters:
@@ -577,21 +663,41 @@ class NeuralMemory(Module):
         return_surprises = True
     ):
         """
-        存储记忆到神经内存中。
+        将输入序列存储到神经内存中
+        
+        该方法是神经内存模块的核心功能之一，负责将输入序列编码为键值对，并使用这些
+        键值对更新内存模型的权重。它实现了一个基于梯度的内存更新机制，通过计算预测
+        损失并反向传播来更新内存。
         
         参数:
-        - seq: 输入序列
-        - weights: 内存网络的权重，如果为None则初始化新权重
-        - past_state: 过去的状态，包含权重和动量信息
-        - seq_index: 当前序列索引
+        - seq: 输入序列，形状为(batch, seq_len, dim)或(views, batch, seq_len, dim)
+        - weights: 内存网络的权重字典，如果为None则初始化新权重
+        - past_state: 过去的状态，包含权重和动量信息的元组
+        - seq_index: 当前序列索引，用于跟踪处理进度
         - prev_weights: 上一层的权重，用于影响当前层的surprise计算
         - mask: 存储掩码，用于控制哪些位置的记忆被存储
-        - return_surprises: 是否返回surprises信息
+        - return_surprises: 是否返回surprises信息，包含损失和自适应学习率
         
         返回值:
-        - updates: 更新后的内存网络权重
-        - next_store_state: 下一个存储状态
+        - updates: 更新后的内存网络权重字典
+        - next_store_state: 下一个存储状态，包含更新后的权重和动量
         - surprises: (可选)包含unweighted_mem_model_loss和adaptive_lr的元组
+        
+        核心实现步骤:
+        1. 输入预处理：将序列裁剪为chunk_size的整数倍，只处理完整的分块
+        2. 权重初始化：如果没有提供权重，则使用init_weights初始化
+        3. 特征提取：通过线性层将输入序列转换为键和值
+        4. 自适应学习率计算：根据输入序列动态计算学习率
+        5. 动量更新：使用动量优化技术平滑内存更新
+        6. 梯度计算：通过functional_call和vmap计算内存模型的梯度
+        7. 权重更新：使用计算得到的梯度和自适应学习率更新内存权重
+        8. 状态管理：返回更新后的权重和下一个存储状态
+        
+        关键技术点:
+        - 分块处理：将长序列分为多个分块，提高处理效率
+        - 自适应学习率：根据输入内容动态调整内存更新强度
+        - 动量优化：使用动量技术提高内存更新的稳定性
+        - 多头注意力：支持多头结构，增强内存表示能力
         """
         if self.qkv_receives_diff_views:
             _, batch, seq_len = seq.shape[:3]
@@ -812,17 +918,34 @@ class NeuralMemory(Module):
     def retrieve_memories(
         self,
         seq,
-        weights: dict[str, Tensor],
+        weights: dict[str, Tensor] | None = None,
     ):
         """
-        从神经内存中检索记忆。
+        从神经内存中检索相关信息
+        
+        该方法是神经内存模块的核心功能之一，负责使用输入序列查询神经内存，
+        并返回与查询相关的记忆信息。它实现了基于注意力机制的记忆检索过程。
         
         参数:
-        - seq: 用于检索记忆的序列
-        - weights: 内存网络的权重
+        - seq: 输入序列，形状为(batch, seq_len, dim)，用于查询记忆
+        - weights: 内存网络的权重字典，包含已存储的记忆信息
         
         返回值:
-        - 检索到的记忆值
+        - retrieved_values: 检索到的记忆值，形状与输入序列一致
+        
+        核心实现步骤:
+        1. 输入预处理：根据分块大小对序列进行填充，确保可以完整处理
+        2. 查询生成：通过线性层将输入序列转换为查询向量
+        3. 多头处理：将查询向量分割为多个注意力头进行并行处理
+        4. 记忆检索：使用functional_call调用内存模型，通过查询访问存储的记忆
+        5. 结果后处理：合并多头结果并移除填充，返回最终检索值
+        
+        关键技术点:
+        - 自动推断单token解码场景，优化处理效率
+        - 动态填充机制，确保序列长度为分块大小的整数倍
+        - 多头注意力机制，增强记忆检索能力
+        - 支持RMSNorm归一化，稳定训练和推理过程
+        - 与MLP内存模型的无缝集成，支持复杂的记忆表示
         """
         chunk_size = self.retrieve_chunk_size
 
@@ -914,22 +1037,43 @@ class NeuralMemory(Module):
         ttt_batch_size: int | None = None
     ):
         """
-        神经内存的前向传播。
+        神经内存的前向传播接口
+        
+        该方法是NeuralMemory类的主要外部接口，协调记忆的存储和检索过程。
+        它接收输入序列，根据当前状态更新内存，并返回检索到的记忆值和新的状态。
         
         参数:
-        - seq: 输入序列
+        - seq: 输入序列，形状为(batch, seq_len, dim)或(views, batch, seq_len, dim)
         - store_seq: 用于存储的序列，如果为None则使用seq
-        - state: 神经内存状态
-        - detach_mem_state: 是否分离内存状态
-        - prev_weights: 上一层的权重
-        - store_mask: 存储掩码
-        - return_surprises: 是否返回surprises
-        - ttt_batch_size: TTT批处理大小
+        - state: 神经内存状态，包含序列索引、权重、缓存、过去状态和更新信息
+        - detach_mem_state: 是否分离内存状态，用于控制梯度流
+        - prev_weights: 上一层的权重，用于影响当前层的surprise计算
+        - store_mask: 存储掩码，用于控制哪些位置的记忆被存储
+        - return_surprises: 是否返回surprises信息，包含损失和自适应学习率
+        - ttt_batch_size: TTT批处理大小，用于控制权重更新的频率
         
         返回值:
-        - 检索到的记忆值
-        - 下一个神经内存状态
-        - (可选)surprises
+        - retrieved_values: 检索到的记忆值，形状与输入序列一致
+        - next_state: 更新后的神经内存状态
+        - surprises: (可选)包含unweighted_mem_model_loss和adaptive_lr的元组
+        
+        核心实现步骤:
+        1. 输入预处理：处理单token输入和多视图输入场景
+        2. 状态初始化：如果没有提供状态，则创建新状态
+        3. 存储序列处理：合并缓存的存储序列和当前存储序列
+        4. 序列分块：根据批处理大小和序列索引确定更新边界和分块大小
+        5. 记忆存储：循环处理每个序列分块，调用store_memories更新内存
+        6. 权重更新：在批处理边界处更新内存模型的权重
+        7. 记忆检索：调用retrieve_memories从更新后的内存中检索信息
+        8. 后处理：根据需要分离内存状态并返回结果
+        
+        关键技术点:
+        - 支持单token解码和批量处理两种模式
+        - 自动处理多视图输入，为查询和键值提供不同的视图
+        - 智能状态管理，支持序列的连续处理
+        - 批处理边界检测，在适当的时机更新内存权重
+        - 支持门控过渡机制，平滑调整内存更新强度
+        - 与store_memories和retrieve_memories方法的无缝集成
         """
         is_multi_input = self.qkv_receives_diff_views
 
