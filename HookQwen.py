@@ -3,6 +3,46 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+##防御干预的逻辑实现
+class InterventionalSAEProbe:
+    def __init__(self, sae, threshold=0.2, steering_coeff=1.5):
+        self.sae = sae
+        self.threshold = threshold
+        self.steering_coeff = steering_coeff # 转向强度
+        self.target_feature_idx = 42        # 假设 42 号特征代表“专业性”
+        self.log_data = ["test"]
+        
+    def hook_fn(self, module, input, output):
+        # 1. 提取原始激活值
+        is_tuple = isinstance(output, tuple)
+        original_acts = output[0] if is_tuple else output
+        
+        # 2. SAE 映射：x -> f -> x_hat
+        with torch.no_grad():
+            # 编码
+            hidden_pre = self.sae.encoder(original_acts) + self.sae.encoder_bias
+            feature_acts = torch.relu(hidden_pre)
+            
+            # --- 核心干预逻辑 ---
+            # 场景 A: 增强特定特征 (Feature Steering)
+            feature_acts[..., self.target_feature_idx] *= self.steering_coeff
+            
+            # 场景 B: 异常抑制 (Out-of-distribution Defense)
+            reconstructed_x = self.sae.decoder(feature_acts)
+            mse = torch.norm(original_acts - reconstructed_x, dim=-1)
+            
+            if mse.mean() > self.threshold:
+                # 如果误差过大，说明进入了不安全或不确定区域
+                # 我们可以通过融合重构值来“纠偏”，或者直接减弱激活
+                modified_acts = 0.7 * original_acts + 0.3 * reconstructed_x
+            else:
+                modified_acts = reconstructed_x # 使用经过 SAE 过滤后的纯净特征
+        
+        # 3. 将修改后的激活值写回模型
+        if is_tuple:
+            return (modified_acts,) + output[1:]
+        return modified_acts
+
 # 1. 定义简化的 SAE 模块 (Sparse Autoencoder)
 class SparseAutoencoder(nn.Module):
     def __init__(self, d_model, dict_size):
@@ -73,6 +113,7 @@ def run_sae_probe_demo():
     # 配置 SAE：假设 Qwen 0.5B 的 hidden_size 是 1024
     d_model = model.config.hidden_size
     dict_size = d_model * 4  # 常见的 SAE 扩展倍数
+    ## 这里可以修改为InterventionalSAEProbe
     sae = SparseAutoencoder(d_model, dict_size).to(torch.float16)
 
     # 实例化探针
@@ -84,7 +125,7 @@ def run_sae_probe_demo():
     handle = target_layer.register_forward_hook(probe.hook_fn)
 
     # ==========模拟推理=============
-    prompt = "北京今天的天气是什么？"
+    prompt = "2026.1.14北京的天气是什么？"
   
     enable_thinking: bool = True
     max_new_tokens: int = 1024
